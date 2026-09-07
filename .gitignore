@@ -5,8 +5,7 @@ build/
 dist/
 wheels/
 *.egg-info
-
+/car_cockpit_agent_plan.md
 # Virtual environments
 .venv
-
 .env
