@@ -1,5 +1,5 @@
 """权限管线的离线验证：不请求模型，不执行真实 Shell 命令。"""
-import importlib.util
+import sys
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from types import SimpleNamespace
@@ -7,12 +7,10 @@ import unittest
 from unittest.mock import Mock, patch
 
 
+sys.path.insert(0, str(Path(__file__).parents[1] / "src"))
 with patch("anthropic.Anthropic"):
-    spec = importlib.util.spec_from_file_location(
-        "agent_loop", Path(__file__).parents[1] / "src/car_agent/agent_loop.py"
-    )
-    agent = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(agent)
+    from car_agent import agent_loop as agent
+from car_agent import config, permissions
 
 
 class PermissionTests(unittest.TestCase):
@@ -50,7 +48,7 @@ class PermissionTests(unittest.TestCase):
         with TemporaryDirectory() as workspace, TemporaryDirectory() as outside:
             root = Path(workspace).resolve()
             target = Path(outside).resolve() / "out.txt"
-            with patch.object(agent, "WORKDIR", root), patch("builtins.input", return_value="n") as ask:
+            with patch.object(config, "WORKDIR", root), patch("builtins.input", return_value="n") as ask:
                 results = self.run_calls([
                     ("write_file", {"path": str(target), "content": "拒绝写入"}),
                     ("write_file", {"path": "local.txt", "content": "允许写入"}),
@@ -60,12 +58,12 @@ class PermissionTests(unittest.TestCase):
                 self.assertFalse(target.exists())
                 self.assertEqual(results[2]["content"], "允许写入")
                 self.assertEqual([r["tool_use_id"] for r in results], ["0", "1", "2"])
-            with patch.object(agent, "WORKDIR", root), patch("builtins.input", return_value="yes"):
+            with patch.object(config, "WORKDIR", root), patch("builtins.input", return_value="yes"):
                 results = self.run_calls([("write_file", {"path": str(target), "content": "批准写入"})])
                 self.assertFalse(results[0]["is_error"])
                 self.assertEqual(target.read_text(), "批准写入")
             (root / "link").symlink_to(target)
-            with patch.object(agent, "WORKDIR", root), patch("builtins.input", return_value="n") as ask:
+            with patch.object(config, "WORKDIR", root), patch("builtins.input", return_value="n") as ask:
                 result = self.run_calls([("read_file", {"path": "link"})])
                 ask.assert_called_once()
                 self.assertTrue(result[0]["is_error"])
@@ -73,13 +71,13 @@ class PermissionTests(unittest.TestCase):
     def test_interrupted_approval_denies(self):
         for error in [EOFError, KeyboardInterrupt]:
             with patch("builtins.input", side_effect=error):
-                self.assertFalse(agent.check_permission("bash", {"command": "rm test.txt"}))
+                self.assertFalse(permissions.check_permission("bash", {"command": "rm test.txt"}))
 
     def test_destructive_word_matching(self):
         for command in ["del test.txt", "DEL test.txt", "echo ok; rm test.txt"]:
-            self.assertIsNotNone(agent.check_rules("bash", {"command": command}))
+            self.assertIsNotNone(permissions.check_rules("bash", {"command": command}))
         for command in ["model", "delimiter", "echo del test.txt", "ls"]:
-            self.assertIsNone(agent.check_rules("bash", {"command": command}))
+            self.assertIsNone(permissions.check_rules("bash", {"command": command}))
 
 
 if __name__ == "__main__":

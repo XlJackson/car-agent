@@ -1,2 +1,3 @@
 def main() -> None:
-    print("Hello from car-agent!")
+    from .agent_loop import main as run
+    run()
