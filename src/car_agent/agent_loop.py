@@ -1,6 +1,7 @@
 """Agent 主体：模型调用、工具执行与消息回填；扩展行为挂在 Hooks 上。"""
 import os
 import sys
+import signal
 from functools import partial
 from pathlib import Path
 
@@ -20,6 +21,7 @@ from car_agent.display import brief, tool_target, print_assistant_text
 from car_agent.skill_loader import build_system_prompt, SKILL_LOADER
 from car_agent.compact import ContextCompactor, COMPACT_TOOL, context_too_long
 from car_agent.memory import MemoryManager, memory_system
+from car_agent.background import BACKGROUND
 
 client = Anthropic(
     api_key=os.getenv("ANTHROPIC_API_KEY"),
@@ -46,7 +48,7 @@ def print_tool_calls(tool_calls: list, round_number: int, prefix: str = "") -> N
     print(f"\n{prefix}第 {round_number} 轮 | {len(tool_calls)} 个工具调用：{names}")
 
 
-def execute_tool(tool_call, hooks, *, handlers=None) -> dict:
+def execute_tool(tool_call, hooks, *, handlers=None, background_owner="main") -> dict:
     """每个请求对应一个结果；拒绝时不执行工具，也不触发 PostToolUse。"""
     result = {
         "type": "tool_result",
@@ -70,7 +72,16 @@ def execute_tool(tool_call, hooks, *, handlers=None) -> dict:
         return result
 
     try:
-        result["content"] = handler(**args)
+        if tool_call.name == "bash":
+            execution_args = dict(args)
+            background = execution_args.pop("run_in_background", False)
+            if type(background) is not bool:
+                raise ValueError("run_in_background 必须为布尔值。")
+            if set(execution_args) != {"command"}:
+                raise ValueError("bash 参数应为 command 和可选 run_in_background。")
+            result["content"] = BACKGROUND.start(execution_args["command"], background_owner) if background else handler(**execution_args)
+        else:
+            result["content"] = handler(**args)
     except Exception as exc:
         result.update(content=f"错误：{exc}", is_error=True)
     # 已尝试执行的工具，无论成功还是异常，均触发执行后事件。
@@ -80,7 +91,8 @@ def execute_tool(tool_call, hooks, *, handlers=None) -> dict:
 
 def agent_loop(messages: list, *, hooks=None, max_rounds: int = config.MAX_ROUNDS,
                tool_schemas=None, tool_handlers=None, system_prompt=None,
-               is_subagent: bool = False, active_request: str | None = None) -> bool:
+               is_subagent: bool = False, active_request: str | None = None,
+               background_owner: str = "main") -> bool:
     """True 表示正常结束；False 表示达到轮数上限。"""
     if max_rounds < 1:
         raise ValueError("max_rounds 必须大于 0。")
@@ -101,7 +113,7 @@ def agent_loop(messages: list, *, hooks=None, max_rounds: int = config.MAX_ROUND
         base_tools = [tool for tool in schemas if tool["name"] not in {"task", "todo_write"}]
         base_handlers = {name: handler for name, handler in handlers.items() if name not in {"task", "todo_write"}}
         handlers["task"] = partial(run_subagent, run_loop=agent_loop, hooks=hooks,
-                                   tools=base_tools, handlers=base_handlers)
+                                   tools=base_tools, handlers=base_handlers, parent_owner=background_owner)
         schemas.append(TASK_TOOL)
     prefix = "[sub] " if is_subagent else ""
     compactor = ContextCompactor(client, active_request, prefix=prefix)
@@ -109,6 +121,11 @@ def agent_loop(messages: list, *, hooks=None, max_rounds: int = config.MAX_ROUND
     schemas = [schema for schema in schemas if schema["name"] != "compact"] + [COMPACT_TOOL]
     active_system = build_system_prompt(config.SYSTEM_PROMPT if system_prompt is None else system_prompt)
     for round_number in range(1, max_rounds + 1):
+        notices = BACKGROUND.collect(background_owner)
+        if notices:
+            notification = {"role": "user", "content": "\n".join(notices)}
+            messages.append(notification)
+            task_messages.append(notification)
         compactor.plan = todo.render() if todo is not None else ""
         messages[:] = compactor.prepare(messages)
         for retry in range(2):
@@ -133,6 +150,9 @@ def agent_loop(messages: list, *, hooks=None, max_rounds: int = config.MAX_ROUND
         if not tool_calls:
             force = hooks.trigger_hooks("Stop", task_messages)
             if force is None:
+                pending = BACKGROUND.pending(background_owner)
+                if pending:
+                    print(f"{prefix}[Background] 仍有 {len(pending)} 项结果待收集；后续输入问题时继续收集，退出会终止运行中的命令。")
                 if todo is not None:
                     todo.report_unfinished()
                 return True
@@ -145,7 +165,7 @@ def agent_loop(messages: list, *, hooks=None, max_rounds: int = config.MAX_ROUND
         for call in tool_calls:
             # 执行到该工具时才显示目标，不把排队的调用误报为已执行。
             print(f"  {prefix}→ {call.name}：{tool_target(call.name, call.input)}", flush=True)
-            result = execute_tool(call, hooks, handlers=handlers)
+            result = execute_tool(call, hooks, handlers=handlers, background_owner=background_owner)
             if result["is_error"]:
                 print(f"  {prefix}失败/拒绝：{brief(result['content'])}", flush=True)
             tool_results.append(result)
@@ -191,7 +211,19 @@ def submit_query(query: str, history: list, *, hooks=None) -> bool:
 
 
 def main():
-    print("Car Agent - s09 Memory")
+    def terminate(signum, frame):
+        raise SystemExit(128 + signum)
+
+    previous = signal.signal(signal.SIGTERM, terminate)
+    try:
+        run_cli()
+    finally:
+        signal.signal(signal.SIGTERM, previous)
+        BACKGROUND.close()
+
+
+def run_cli():
+    print("Car Agent - Background Tasks")
     print(f"长期记忆：{'开启' if config.MEMORY_ENABLED else '关闭'}（项目 .memory/）")
     print(f"可用技能：{', '.join(SKILL_LOADER.skills) or '无'}（启动时扫描 skills/）")
     print(f"输入 q / exit 退出；每次任务最多 {config.MAX_ROUNDS} 轮模型调用\n")

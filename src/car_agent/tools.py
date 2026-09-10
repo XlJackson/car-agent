@@ -52,7 +52,11 @@ TOOLS = [
                 "command": {
                     "type": "string",
                     "description": "需要在终端中执行的 Shell 命令。",
-                }
+                },
+                "run_in_background": {
+                    "type": "boolean", "default": False,
+                    "description": "慢命令且有不依赖其结果的工作可先做时设为 true；立即返回任务编号，后续轮次收集结果。",
+                },
             },
             "required": ["command"],
         },

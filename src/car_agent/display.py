@@ -18,7 +18,7 @@ def tool_target(name, args):
             target += f" | 行数上限：{brief(args['limit'], 12)}"
         return target
     if name == "bash":
-        return brief(args.get("command", "缺少命令"))
+        return ("[后台] " if args.get("run_in_background") is True else "") + brief(args.get("command", "缺少命令"))
     if name == "glob":
         return brief(args.get("pattern", "缺少模式"))
     if name == "task":
