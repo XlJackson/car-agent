@@ -3,9 +3,46 @@ import subprocess
 from pathlib import Path
 from . import config
 from .config import resolve_path
+from .todo import run_todo_write
+from .skill_loader import run_load_skill
 
 
 TOOLS = [
+    {
+        "name": "load_skill",
+        "description": "按技能目录中的名称读取完整 SKILL.md。参数为技能名，不是路径。",
+        "input_schema": {
+            "type": "object",
+            "properties": {"name": {"type": "string", "minLength": 1}},
+            "required": ["name"],
+            "additionalProperties": False,
+        },
+    },
+    {
+        "name": "todo_write",
+        "description": "创建或更新本次任务的可见计划。每次提交完整列表（包括已完成步骤）；"
+        "执行前标为 in_progress，确认完成后标为 completed。只管理计划，不执行实际操作。",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "todos": {
+                    "type": "array",
+                    "maxItems": 20,
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "content": {"type": "string", "minLength": 1, "maxLength": 200},
+                            "status": {"type": "string", "enum": ["pending", "in_progress", "completed"]},
+                        },
+                        "required": ["content", "status"],
+                        "additionalProperties": False,
+                    },
+                },
+            },
+            "required": ["todos"],
+            "additionalProperties": False,
+        },
+    },
     {
         "name": "bash",
         "description": "在当前工作目录中执行一条 Shell 命令。",
@@ -152,6 +189,8 @@ def run_glob(pattern: str) -> str:
 # Schema 告诉模型如何调用；Handler 告诉程序实际执行什么。
 # 增加工具：实现函数 + 添加 Schema + 在此注册；不修改循环。
 TOOL_HANDLERS = {
+    "load_skill": run_load_skill,
+    "todo_write": run_todo_write,
     "bash": run_bash,
     "read_file": run_read,
     "write_file": run_write,

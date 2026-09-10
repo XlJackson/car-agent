@@ -9,3 +9,8 @@ wheels/
 # Virtual environments
 .venv
 .env
+
+# 本地对话归档和工具输出（可能包含用户数据）
+.transcripts/
+.task_outputs/
+.memory/
