@@ -5,6 +5,7 @@ from . import config
 from .config import resolve_path
 from .todo import run_todo_write
 from .skill_loader import run_load_skill
+from .permissions import UNATTENDED
 
 
 TOOLS = [
@@ -124,6 +125,7 @@ def run_bash(command: str) -> str:
             command,
             shell=True,
             cwd=config.WORKDIR,
+            stdin=subprocess.DEVNULL if UNATTENDED.get() else None,
             capture_output=True,
             text=True,
             timeout=120,

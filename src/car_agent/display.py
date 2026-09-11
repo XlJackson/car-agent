@@ -8,6 +8,12 @@ def brief(value, limit=180):
 
 
 def tool_target(name, args):
+    if name == "schedule_cron":
+        return brief(f"{args.get('cron', '')} | {args.get('prompt', '')}")
+    if name == "list_crons":
+        return "查看定时任务"
+    if name == "cancel_cron":
+        return brief(args.get("job_id", "缺少任务 ID"))
     if name == "compact":
         return "本轮工具完成后归档并总结历史"
     if name == "load_skill":

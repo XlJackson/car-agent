@@ -2,6 +2,7 @@
 import os
 import sys
 import signal
+import threading
 from functools import partial
 from pathlib import Path
 
@@ -22,12 +23,16 @@ from car_agent.skill_loader import build_system_prompt, SKILL_LOADER
 from car_agent.compact import ContextCompactor, COMPACT_TOOL, context_too_long
 from car_agent.memory import MemoryManager, memory_system
 from car_agent.background import BACKGROUND
+from car_agent import scheduler
+from car_agent.permissions import UNATTENDED
+from car_agent.terminal import TerminalInput
 
 client = Anthropic(
     api_key=os.getenv("ANTHROPIC_API_KEY"),
     base_url=os.getenv("ANTHROPIC_BASE_URL"),
 )
 HOOKS = create_default_hooks()
+AGENT_LOCK = threading.Lock()
 
 
 def clean_response_content(content: list) -> list:
@@ -92,7 +97,7 @@ def execute_tool(tool_call, hooks, *, handlers=None, background_owner="main") ->
 def agent_loop(messages: list, *, hooks=None, max_rounds: int = config.MAX_ROUNDS,
                tool_schemas=None, tool_handlers=None, system_prompt=None,
                is_subagent: bool = False, active_request: str | None = None,
-               background_owner: str = "main") -> bool:
+               background_owner: str = "main", on_response=None) -> bool:
     """True 表示正常结束；False 表示达到轮数上限。"""
     if max_rounds < 1:
         raise ValueError("max_rounds 必须大于 0。")
@@ -104,10 +109,14 @@ def agent_loop(messages: list, *, hooks=None, max_rounds: int = config.MAX_ROUND
     todo = None if is_subagent else TodoManager()
     schemas = list(TOOLS if tool_schemas is None else tool_schemas)
     handlers = dict(TOOL_HANDLERS if tool_handlers is None else tool_handlers)
+    if not is_subagent and not UNATTENDED.get():
+        schemas.extend(scheduler.CRON_TOOLS)
+        handlers.update(scheduler.CRON_HANDLERS)
     if is_subagent:
         # 不仅不向模型展示，也在执行分发表中移除，防止伪造调用递归。
-        schemas = [tool for tool in schemas if tool["name"] not in {"task", "todo_write"}]
-        handlers = {name: handler for name, handler in handlers.items() if name not in {"task", "todo_write"}}
+        excluded = {"task", "todo_write", *scheduler.CRON_HANDLERS}
+        schemas = [tool for tool in schemas if tool["name"] not in excluded]
+        handlers = {name: handler for name, handler in handlers.items() if name not in excluded}
     else:
         handlers["todo_write"] = todo.write
         base_tools = [tool for tool in schemas if tool["name"] not in {"task", "todo_write"}]
@@ -115,12 +124,14 @@ def agent_loop(messages: list, *, hooks=None, max_rounds: int = config.MAX_ROUND
         handlers["task"] = partial(run_subagent, run_loop=agent_loop, hooks=hooks,
                                    tools=base_tools, handlers=base_handlers, parent_owner=background_owner)
         schemas.append(TASK_TOOL)
-    prefix = "[sub] " if is_subagent else ""
+    prefix = "[sub] " if is_subagent else ("[Scheduled] " if UNATTENDED.get() else "")
     compactor = ContextCompactor(client, active_request, prefix=prefix)
     handlers["compact"] = compactor.request
     schemas = [schema for schema in schemas if schema["name"] != "compact"] + [COMPACT_TOOL]
     active_system = build_system_prompt(config.SYSTEM_PROMPT if system_prompt is None else system_prompt)
     for round_number in range(1, max_rounds + 1):
+        if UNATTENDED.get() and scheduler.SCHEDULER is not None and scheduler.SCHEDULER.stop_event.is_set():
+            return False
         notices = BACKGROUND.collect(background_owner)
         if notices:
             notification = {"role": "user", "content": "\n".join(notices)}
@@ -140,6 +151,9 @@ def agent_loop(messages: list, *, hooks=None, max_rounds: int = config.MAX_ROUND
                     raise
                 messages[:] = compactor.compact_history(messages, reactive=True)
         compactor.mark_consumed(messages)
+        if on_response is not None:
+            on_response()
+            on_response = None
         messages.append({"role": "assistant", "content": clean_response_content(response.content)})
         task_messages.append(messages[-1])
         if not is_subagent:
@@ -163,6 +177,8 @@ def agent_loop(messages: list, *, hooks=None, max_rounds: int = config.MAX_ROUND
 
         tool_results = []
         for call in tool_calls:
+            if UNATTENDED.get() and scheduler.SCHEDULER is not None and scheduler.SCHEDULER.stop_event.is_set():
+                return False
             # 执行到该工具时才显示目标，不把排队的调用误报为已执行。
             print(f"  {prefix}→ {call.name}：{tool_target(call.name, call.input)}", flush=True)
             result = execute_tool(call, hooks, handlers=handlers, background_owner=background_owner)
@@ -216,26 +232,51 @@ def main():
 
     previous = signal.signal(signal.SIGTERM, terminate)
     try:
+        scheduler.SCHEDULER = scheduler.CronScheduler(config.WORKDIR / ".scheduled_tasks.json")
+        scheduler.SCHEDULER.start(AGENT_LOCK, run_scheduled_job)
         run_cli()
     finally:
+        if scheduler.SCHEDULER is not None:
+            scheduler.SCHEDULER.close()
         signal.signal(signal.SIGTERM, previous)
         BACKGROUND.close()
 
 
+def run_scheduled_job(job, acknowledge):
+    token = UNATTENDED.set(True)
+    owner = "scheduled_" + job.id
+    try:
+        print(f"\n[Scheduled] {job.id}：{brief(job.prompt)}", flush=True)
+        history = []
+        HOOKS.trigger_hooks("UserPromptSubmit", job.prompt, history)
+        history.append({"role": "user", "content": "[Scheduled] " + job.prompt})
+        # 不把系统生成的定时指令提取为用户长期记忆。
+        agent_loop(history, active_request=job.prompt, background_owner=owner,
+                   on_response=acknowledge,
+                   system_prompt=config.SYSTEM_PROMPT + "\n这是无人值守定时任务。不能请求用户输入；审批被拒就说明。不要注册新的定时任务。")
+    finally:
+        BACKGROUND.transfer(owner, "main")
+        UNATTENDED.reset(token)
+
+
 def run_cli():
-    print("Car Agent - Background Tasks")
+    terminal = TerminalInput()
+    print("Car Agent - Cron Scheduler")
     print(f"长期记忆：{'开启' if config.MEMORY_ENABLED else '关闭'}（项目 .memory/）")
     print(f"可用技能：{', '.join(SKILL_LOADER.skills) or '无'}（启动时扫描 skills/）")
     print(f"输入 q / exit 退出；每次任务最多 {config.MAX_ROUNDS} 轮模型调用\n")
     history = []
     while True:
         try:
-            query = input("car-agent >> ").strip()
+            query = terminal.read().strip()
             if query.lower() in {"q", "exit"}:
                 break
             if not query:
                 continue
-            submit_query(query, history)
+            if AGENT_LOCK.locked():
+                print("[Cron] 定时任务正在执行，本次输入排队等待。")
+            with AGENT_LOCK:
+                submit_query(query, history)
             print()
         except (KeyboardInterrupt, EOFError):
             # 直接退出，不复用可能缺少 tool_result 的中断历史。

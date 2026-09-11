@@ -1,7 +1,9 @@
 """s03：权限决策，由 PreToolUse Hook 调用。"""
 import re
+from contextvars import ContextVar
 from . import config
 from .config import resolve_path
+UNATTENDED = ContextVar("unattended", default=False)
 
 
 # 教学用字符串/正则匹配，并非 Shell 沙箱，不能覆盖所有命令变体。
@@ -42,6 +44,9 @@ def check_rules(tool_name: str, args: dict) -> str | None:
 
 
 def ask_user(tool_name: str, args: dict, reason: str) -> bool:
+    if UNATTENDED.get():
+        print(f"[Scheduled] 拒绝 {tool_name}：需要人工审批（{reason}）。")
+        return False
     print(f"\n需要审批：{reason} | 工具：{tool_name}")
     # 不打印文件正文；命令须完整展示，以便知道批准的具体操作。
     target = args["command"] if tool_name == "bash" else args["path"]
