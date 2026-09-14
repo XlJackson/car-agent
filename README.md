@@ -68,8 +68,9 @@ flowchart TD
 | 上下文压缩 | 大结果转存 → 旧消息裁剪 → 旧结果缩短 → 模型摘要，保护工具调用与结果配对 |
 | 长期记忆 | Markdown 存储，相关性召回、候选校验、重复过滤和带快照的整理恢复 |
 | 终端反馈 | 显示计划、工具目标摘要、父 Agent 正文和失败提示，子循环以 `[sub]` 标识 |
+| MCP | 真实 stdio 服务连接、工具发现、每轮动态组装与宿主权限策略 |
 
-交互主 Agent 有 12 个工具；子 Agent 保留 7 个（不含 `todo_write`、`task` 和三个定时工具），定时回合不提供再次注册定时任务的工具：
+CLI 交互主 Agent 有 13 个内置工具，另加已连接的 MCP 工具；子 Agent 保留 7 个内置工具及已连接的 MCP 工具，不提供规划、委派、定时管理或建立 MCP 连接的工具。定时回合也不能建立 MCP 连接或管理定时任务。
 
 | 工具 | 用途 |
 |---|---|
@@ -81,6 +82,7 @@ flowchart TD
 | `load_skill` | 加载完整技能说明，内置 `code-review` |
 | `compact` | 当前工具批次结束后归档并总结历史 |
 | `schedule_cron` / `list_crons` / `cancel_cron` | 注册、查看和取消定时任务 |
+| `connect_mcp` | 连接已配置服务，下一轮发现 `mcp__服务名__工具名` |
 
 记忆在每次主任务开始时召回：最多 50 条目录候选交给模型判断，最多选 5 条、正文总计不超过 6000 字符。正常结束后，只从本次用户原话提取长期候选，不从工具输出或助手回答推断用户事实。子 Agent 不独立召回或写入长期记忆。
 
@@ -96,6 +98,8 @@ src/car_agent/
 ├── display.py        # 终端输出
 ├── background.py     # 后台命令、完成通知和进程清理
 ├── scheduler.py      # Cron 校验、持久化、到期队列和串行交付
+├── mcp_tools.py      # stdio 连接、发现、动态工具池与宿主策略
+├── terminal.py       # 后台输出时恢复输入行
 ├── todo.py           # 计划状态与提醒
 ├── subagent.py       # 子任务委派
 ├── skill_loader.py   # 技能目录与加载
@@ -105,6 +109,8 @@ src/car_agent/
 └── __init__.py       # 包入口
 skills/code-review/SKILL.md
 tests/               # 离线测试
+examples/mcp_demo_server.py  # 真实 stdio 演示服务
+mcp_servers.example.json    # 可提交的配置示例
 ```
 
 `.env`、`.venv/`、`.memory/`、`.transcripts/` 和 `.task_outputs/` 已加入 Git 忽略规则。记忆用于跨会话复用，归档用于恢复历史细节；二者不自动互转，也不自动清理。
@@ -128,6 +134,28 @@ tests/               # 离线测试
 ## 扩展与验证
 
 新增工具时定义 Schema 和处理函数并注册；新增生命周期行为时注册 Hook；新增技能时添加 `skills/<name>/SKILL.md` 并重启。
+
+## MCP 外部工具
+
+使用官方 MCP Python SDK 的 stdio transport，连接时启动本地服务进程，完成初始化和 `tools/list`，调用时发送 `tools/call`。这是实际协议通信；演示服务只提供加法和版本查询，不接入外部账号。
+
+首次配置：
+
+```bash
+uv sync --inexact
+cp -n mcp_servers.example.json mcp_servers.json
+uv run --inexact car-agent
+```
+
+输入：`连接 demo MCP 服务，计算 20 加 22，并查询演示服务版本。` 首次连接会显示启动命令并询问审批；确认后应看到 `connect_mcp` → `mcp__demo__add` / `mcp__demo__get_version`。参数错误通过 `is_error` 工具结果返回给模型。
+
+`mcp_servers.json` 的 `servers` 按名称配置 `command`、`args`、`env_vars`、`connect_policy` 和 `tool_policy`，参考示例文件。`${PYTHON}` 代表当前 Python 解释器，服务工作目录为配置文件所在目录。`env_vars` 只列需要从宿主环境转发的变量名；SDK 另保留必要的默认环境变量。不要将密钥写入参数或示例文件。本地配置已被 Git 忽略，启动时读取快照，修改后重启生效。
+
+- **权限**：连接和未配置的外部工具默认 `confirm`；也可由宿主明确设置 `allow` / `deny`。工具策略按服务及原始工具名配置，不信任 server 的只读提示。子 Agent 与定时回合复用已连接工具及同一权限 Hook；定时回合需要确认的操作直接拒绝。
+- **生命周期**：每个连接使用独立 I/O 线程维护 SDK 异步会话，Agent 同步等待调用结果。连接和单次调用约 30 秒超时，无自动重试写操作；断开后可重新连接。退出时关闭会话并由 SDK 清理服务进程。MCP 不是沙箱，批准连接代表允许运行配置中的本地程序。
+- **边界**：仅支持 stdio、工具发现和文本/结构化结果；非文本内容返回省略提示。暂不支持 HTTP/OAuth、资源和提示模板工具、运行中工具列表变更通知。每服务最多发现 128 个工具，规范化后的命名冲突会拒绝连接。服务 stderr 不进入对话或终端，连接失败返回错误类型；排障可独立运行配置命令查看服务日志。
+
+定时任务若要调用 MCP，应先在交互回合连接服务，并只为确实允许无人值守运行的工具设置 `allow`。重启不会自动重连 MCP。
 
 离线测试使用模拟模型和临时目录，覆盖权限、计划、上下文隔离、技能加载、压缩配对及记忆恢复。测试验证程序逻辑，不保证真实模型每次都能正确规划、选择工具或总结事实。
 

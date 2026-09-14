@@ -1,5 +1,6 @@
 """s03：权限决策，由 PreToolUse Hook 调用。"""
 import re
+import json
 from contextvars import ContextVar
 from . import config
 from .config import resolve_path
@@ -49,7 +50,11 @@ def ask_user(tool_name: str, args: dict, reason: str) -> bool:
         return False
     print(f"\n需要审批：{reason} | 工具：{tool_name}")
     # 不打印文件正文；命令须完整展示，以便知道批准的具体操作。
-    target = args["command"] if tool_name == "bash" else args["path"]
+    if tool_name == 'connect_mcp' or tool_name.startswith('mcp__'):
+        from .mcp_tools import MANAGER
+        target = json.dumps(MANAGER.approval_target(tool_name, args), ensure_ascii=False)
+    else:
+        target = args["command"] if tool_name == "bash" else args["path"]
     print(f"目标：{target!r}")
     try:
         return input("仅允许本次操作？[y/N] ").strip().lower() in {"y", "yes"}
@@ -59,6 +64,15 @@ def ask_user(tool_name: str, args: dict, reason: str) -> bool:
 
 
 def check_permission(tool_name: str, args: dict) -> bool:
+    if tool_name == 'connect_mcp' or tool_name.startswith('mcp__'):
+        from .mcp_tools import MANAGER
+        policy = MANAGER.policy(tool_name, args) if MANAGER is not None else 'deny'
+        if policy == 'deny':
+            print(f'已阻止：MCP 宿主策略拒绝 {tool_name}')
+            return False
+        if policy == 'confirm':
+            return ask_user(tool_name, args, '连接 MCP 会启动本地进程' if tool_name == 'connect_mcp' else '外部 MCP 工具需要确认')
+        return True
     if tool_name == "bash":
         reason = check_deny_list(args["command"])
         if reason:

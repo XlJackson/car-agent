@@ -16,3 +16,4 @@ wheels/
 .memory/
 .scheduled_tasks.json
 .scheduled_tasks.*.tmp
+mcp_servers.json

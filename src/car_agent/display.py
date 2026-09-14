@@ -8,6 +8,10 @@ def brief(value, limit=180):
 
 
 def tool_target(name, args):
+    if name == 'connect_mcp':
+        return brief(args.get('name', '缺少服务名'))
+    if name.startswith('mcp__'):
+        return brief('参数字段：' + ', '.join(args)) if args else '无参数'
     if name == "schedule_cron":
         return brief(f"{args.get('cron', '')} | {args.get('prompt', '')}")
     if name == "list_crons":

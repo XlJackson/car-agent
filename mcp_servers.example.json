@@ -1,0 +1,14 @@
+{
+  "servers": {
+    "demo": {
+      "command": "${PYTHON}",
+      "args": ["examples/mcp_demo_server.py"],
+      "env_vars": [],
+      "connect_policy": "confirm",
+      "tool_policy": {
+        "add": "allow",
+        "get_version": "allow"
+      }
+    }
+  }
+}
